@@ -1,0 +1,9 @@
+C:\Users\crumpette\Documents\Tools\Client\client.cpp;C:\Users\crumpette\Documents\Tools\Client\Client\x64\Release\client.obj
+C:\Users\crumpette\Documents\Tools\Client\clint\clint.cpp;C:\Users\crumpette\Documents\Tools\Client\Client\x64\Release\clint.obj
+C:\Users\crumpette\Documents\Tools\Client\clrt\clrt.cpp;C:\Users\crumpette\Documents\Tools\Client\Client\x64\Release\clrt.obj
+C:\Users\crumpette\Documents\Tools\Client\main.cpp;C:\Users\crumpette\Documents\Tools\Client\Client\x64\Release\main.obj
+C:\Users\crumpette\Documents\Tools\Client\scan\efi.cpp;C:\Users\crumpette\Documents\Tools\Client\Client\x64\Release\efi.obj
+C:\Users\crumpette\Documents\Tools\Client\scan\image.cpp;C:\Users\crumpette\Documents\Tools\Client\Client\x64\Release\image.obj
+C:\Users\crumpette\Documents\Tools\Client\scan\mouse.cpp;C:\Users\crumpette\Documents\Tools\Client\Client\x64\Release\mouse.obj
+C:\Users\crumpette\Documents\Tools\Client\scan\pci.cpp;C:\Users\crumpette\Documents\Tools\Client\Client\x64\Release\pci.obj
+C:\Users\crumpette\Documents\Tools\Client\utils.cpp;C:\Users\crumpette\Documents\Tools\Client\Client\x64\Release\utils.obj
