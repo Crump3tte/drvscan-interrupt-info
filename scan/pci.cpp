@@ -34,6 +34,7 @@ typedef struct {
 	unsigned char  blk_info;  // reason for blocking
 	DEVICE_INFO    self;      // self data
 	std::vector<DEVICE_INFO> devices;
+	std::string gummybear_reason; // New field to store gummybear detection reason
 } PORT_DEVICE_INFO;
 
 namespace scan
@@ -387,199 +388,193 @@ static void scan::check_hidden(PORT_DEVICE_INFO &port)
 
 static void scan::check_gummybear(BOOL advanced, PORT_DEVICE_INFO& port)
 {
-	UNREFERENCED_PARAMETER(advanced);
+    for (auto& dev : port.devices)
+    {
+        if (!dev.cfg.command().bus_master_enable())
+        {
+            continue;
+        }
 
-	for (auto& dev : port.devices)
-	{
-		if (!dev.cfg.command().bus_master_enable())
-		{
-			continue;
-		}
+        // Testing standard default capabilities
+        if (dev.cfg.status().capabilities_list())
+        {
+            for (BYTE cap_id = 0; cap_id < config::MAX_CAPABILITIES; cap_id++)
+            {
+                BYTE cap = dev.cfg.get_capability_by_id(cap_id);
+                if (cap == 0) continue;
 
-		//
-		// testing standard default capabilities
-		//
-		if (dev.cfg.status().capabilities_list())
-		{
-			for (BYTE cap_id = 0; cap_id < config::MAX_CAPABILITIES; cap_id++)
-			{
-				BYTE cap = dev.cfg.get_capability_by_id(cap_id);
+                // Test if everything can be written
+                cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap, 0);
+                if (cl::pci::read<WORD>(dev.bus, dev.slot, dev.func, cap) != *(WORD*)(dev.cfg.raw + cap))
+                {
+                    cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap, *(WORD*)(dev.cfg.raw + cap));
+                    port.blk = 2;
+                    port.blk_info = 23;
+                    port.gummybear_reason = "Everything can be written in default capabilities. Fix it noob " + std::to_string(cap_id);
+                    return;
+                }
 
-				if (cap == 0)
-				{
-					continue;
-				}
+                // Specific checks for different capability IDs
+                switch (cap_id)
+                {
+                    case 0x05: // MSI
+                        {
+                            auto msi = dev.cfg.get_msi();
+                            BYTE ctrl = msi.cap.msi_cap_64_bit_addr_capable() ?
+                                (msi.cap.raw & 0xFF) & ~(1 << 7) :
+                                (msi.cap.raw & 0xFF) | (1 << 7);
 
-				//
-				// test if everything can be written
-				//
-				cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap, 0);
-				if (cl::pci::read<WORD>(dev.bus, dev.slot, dev.func, cap) != *(WORD*)(dev.cfg.raw + cap))
-				{
-					cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap, *(WORD*)(dev.cfg.raw + cap));
-					port.blk = 2;
-					port.blk_info = 23;
-					return;
-				}
+                            cl::pci::write<BYTE>(dev.bus, dev.slot, dev.func, cap + 0x02, ctrl);
+                            if (GET_BIT(cl::pci::read<BYTE>(dev.bus, dev.slot, dev.func, cap + 0x02), 7) !=
+                                msi.cap.msi_cap_64_bit_addr_capable())
+                            {
+                                port.blk = 2;
+                                port.blk_info = 23;
+                                port.gummybear_reason = "MSI - 64 bit address capable bit";
+                                return;
+                            }
+                        }
+                        break;
 
-				if (cap_id == 0x01) // PM (R/W & R/O)
-				{
-				}
+                    case 0x10: // PCI-X
+                        {
+                            auto pci = dev.cfg.get_pci();
+                            BYTE offs = pci.base_ptr + 0x04 + 0x04;
 
-				else if (cap_id == 0x05) // MSI (R/O)
-				{
-					auto msi = dev.cfg.get_msi();
-					BYTE ctrl = msi.cap.msi_cap_64_bit_addr_capable() ?
-						(msi.cap.raw & 0xFF) & ~(1 << 7) :
-						(msi.cap.raw & 0xFF) | (1 << 7);
+                            WORD data = pci.dev.control.dev_ctrl_ur_reporting() ?
+                                pci.dev.control.raw & ~(1 << 3) : pci.dev.control.raw | (1 << 3);
 
-					cl::pci::write<BYTE>(dev.bus, dev.slot, dev.func, cap + 0x02, ctrl);
-					if (GET_BIT(cl::pci::read<BYTE>(dev.bus, dev.slot, dev.func, cap + 0x02), 7) !=
-						msi.cap.msi_cap_64_bit_addr_capable())
-					{
-						port.blk = 2;
-						port.blk_info = 23;
-						return;
-					}
-				}
+                            cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, offs, data);
+                            if (cl::pci::read<WORD>(dev.bus, dev.slot, dev.func, offs) == pci.dev.control.raw)
+                            {
+                                port.blk = 2;
+                                port.blk_info = 23;
+                                port.gummybear_reason = "PCIE - Device Control Register - Unsupported Request Reporting";
+                                return;
+                            }
+                            else
+                            {
+                                cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, offs, pci.dev.control.raw);
+                            }
 
-				else if (cap_id == 0x10) // PCI-X (R/W)
-				{
-					auto pci = dev.cfg.get_pci();
-					BYTE offs = pci.base_ptr + 0x04 + 0x04;
+                            if (!pci.dev.status.unsupported_request_detected()) continue;
+                            cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, offs + 0x02, pci.dev.status.raw);
+                            pci.dev.status.raw = cl::pci::read<WORD>(dev.bus, dev.slot, dev.func, offs + 0x02);
+                            if (pci.dev.status.unsupported_request_detected())
+                            {
+                                port.blk = 2;
+                                port.blk_info = 23;
+                                port.gummybear_reason = "PCIE - Device Status Register - Unsupported Request Detected";
+                                return;
+                            }
+                        }
+                        break;
 
-					WORD data = pci.dev.control.dev_ctrl_ur_reporting() ?
-						pci.dev.control.raw & ~(1 << 3) : pci.dev.control.raw | (1 << 3);
+                    case 0x11: // MSIX
+                        {
+                            auto msix = dev.cfg.get_msix();
+                            BYTE msix_val = *(BYTE*)(dev.cfg.raw + msix.base_ptr + 0x02);
+                            cl::pci::write<BYTE>(dev.bus, dev.slot, dev.func, msix.base_ptr + 0x02, msix_val + 1);
+                            if (cl::pci::read<BYTE>(dev.bus, dev.slot, dev.func, msix.base_ptr + 0x02) != msix_val)
+                            {
+                                cl::pci::write<BYTE>(dev.bus, dev.slot, dev.func, msix.base_ptr + 0x02, msix_val);
+                                port.blk = 2;
+                                port.blk_info = 23;
+                                port.gummybear_reason = "MSIX - PBA";
+                                return;
+                            }
+                        }
+                        break;
+                }
+            }
+        }
 
-					cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, offs, data);
-					if (cl::pci::read<WORD>(dev.bus, dev.slot, dev.func, offs) == pci.dev.control.raw)
-					{
-						port.blk = 2;
-						port.blk_info = 23;
-						return;
-					}
-					else
-					{
-						cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, offs, pci.dev.control.raw);
-					}
+        // Testing extended capabilities
+        for (BYTE cap_id = 0; cap_id < config::MAX_EXTENDED_CAPABILITIES; cap_id++)
+        {
+            WORD cap = dev.cfg.get_ext_capability_by_id(cap_id);
+            if (cap == 0) continue;
 
-					// risky, risky
-					if (!pci.dev.status.unsupported_request_detected()) continue;
-					cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, offs + 0x02, pci.dev.status.raw);
-					pci.dev.status.raw = cl::pci::read<WORD>(dev.bus, dev.slot, dev.func, offs + 0x02);
-					if (pci.dev.status.unsupported_request_detected())
-					{
-						port.blk = 2;
-						port.blk_info = 23;
-						return;
-					}
-				}
+            // Test if everything can be written
+            cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap, 0);
+            if (cl::pci::read<WORD>(dev.bus, dev.slot, dev.func, cap) != *(WORD*)(dev.cfg.raw + cap))
+            {
+                cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap, *(WORD*)(dev.cfg.raw + cap));
+                port.blk = 2;
+                port.blk_info = 23;
+                port.gummybear_reason = "Everything can be written in extended capabilities. Fix it noob " + std::to_string(cap_id);
+                return;
+            }
 
-				else if (cap_id == 0x11) // msix (R/O) test
-				{
-					auto msix = dev.cfg.get_msix();
-					BYTE msix_val = *(BYTE*)(dev.cfg.raw + msix.base_ptr + 0x02);
-					cl::pci::write<BYTE>(dev.bus, dev.slot, dev.func, msix.base_ptr + 0x02, msix_val + 1);
-					if (cl::pci::read<BYTE>(dev.bus, dev.slot, dev.func, msix.base_ptr + 0x02) != msix_val)
-					{
-						cl::pci::write<BYTE>(dev.bus, dev.slot, dev.func, msix.base_ptr + 0x02, msix_val);
-						port.blk = 2;
-						port.blk_info = 23;
-						return;
-					}
-				}
-			}
-		}
+            // Specific checks for different extended capability IDs
+            switch (cap_id)
+            {
+                case 0x02: // VC
+                    {
+                        WORD resrc_status = *(WORD*)(dev.cfg.raw + cap + 0x1A);
+                        cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap + 0x1A, resrc_status + 1);
+                        if (cl::pci::read<WORD>(dev.bus, dev.slot, dev.func, cap + 0x1A) != resrc_status)
+                        {
+                            port.blk = 2;
+                            port.blk_info = 23;
+                            port.gummybear_reason = "VC capability - Resource Status";
+                            return;
+                        }
+                    }
+                    break;
 
-		//
-		// testing extended capabilities
-		//
-		for (BYTE cap_id = 0; cap_id < config::MAX_EXTENDED_CAPABILITIES; cap_id++)
-		{
-			WORD cap = dev.cfg.get_ext_capability_by_id(cap_id);
+                case 0x03: // DSN
+                    {
+                        DWORD lower_32bits = *(DWORD*)(dev.cfg.raw + cap + 0x04);
+                        cl::pci::write<DWORD>(dev.bus, dev.slot, dev.func, cap + 0x04, lower_32bits + 1);
+                        if (cl::pci::read<DWORD>(dev.bus, dev.slot, dev.func, cap + 0x04) != lower_32bits)
+                        {
+                            cl::pci::write<DWORD>(dev.bus, dev.slot, dev.func, cap + 0x04, lower_32bits);
+                            port.blk = 2;
+                            port.blk_info = 23;
+                            port.gummybear_reason = "DSN capability - Lower 32 bits";
+                            return;
+                        }
+                    }
+                    break;
 
-			if (cap == 0)
-			{
-				continue;
-			}
+                case 0x0B: // VSEC
+                    {
+                        WORD vsec_id = *(WORD*)(dev.cfg.raw + cap + 0x04);
+                        cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap + 0x04, vsec_id + 1);
+                        if (cl::pci::read<WORD>(dev.bus, dev.slot, dev.func, cap + 0x04) != vsec_id)
+                        {
+                            cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap + 0x04, vsec_id);
+                            port.blk = 2;
+                            port.blk_info = 23;
+                            port.gummybear_reason = "VSEC capability - VSEC ID";
+                            return;
+                        }
+                    }
+                    break;
 
-			//
-			// test if everything can be written
-			//
-			cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap, 0);
-			if (cl::pci::read<WORD>(dev.bus, dev.slot, dev.func, cap) != *(WORD*)(dev.cfg.raw + cap))
-			{
-				cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap, *(WORD*)(dev.cfg.raw + cap));
-				port.blk = 2;
-				port.blk_info = 23;
-				return;
-			}
-
-			if (cap_id == 0x01) // AER
-			{
-			}
-
-			else if (cap_id == 0x02) // VC [R/O] test
-			{
-				WORD resrc_status = *(WORD*)(dev.cfg.raw + cap + 0x1A);
-				cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap + 0x1A, resrc_status + 1);
-				if (cl::pci::read<WORD>(dev.bus, dev.slot, dev.func, cap + 0x1A) != resrc_status)
-				{
-					port.blk = 2;
-					port.blk_info = 23;
-					return;
-				}
-			}
-
-			else if (cap_id == 0x03) // DSN
-			{
-				DWORD lower_32bits = *(DWORD*)(dev.cfg.raw + cap + 0x04);
-				cl::pci::write<DWORD>(dev.bus, dev.slot, dev.func, cap + 0x04, lower_32bits + 1);
-				if (cl::pci::read<DWORD>(dev.bus, dev.slot, dev.func, cap + 0x04) != lower_32bits)
-				{
-					cl::pci::write<DWORD>(dev.bus, dev.slot, dev.func, cap + 0x04, lower_32bits);
-					port.blk = 2;
-					port.blk_info = 23;
-					return;
-				}
-			}
-
-			else if (cap_id == 0x0B) // VSEC [R/O]
-			{
-				WORD vsec_id = *(WORD*)(dev.cfg.raw + cap + 0x04);
-				cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap + 0x04, vsec_id + 1);
-				if (cl::pci::read<WORD>(dev.bus, dev.slot, dev.func, cap + 0x04) != vsec_id)
-				{
-					cl::pci::write<WORD>(dev.bus, dev.slot, dev.func, cap + 0x04, vsec_id);
-					port.blk = 2;
-					port.blk_info = 23;
-					return;
-				}
-			}
-
-			else if (cap_id == 0x1E)
-			{
-			}
-
-			else if (cap_id == 0x18) // Latency Tolerance Reporting (LTR) [R/W]
-			{
-				BYTE max_snoop_latency = *(BYTE*)(dev.cfg.raw + cap + 0x04);
-				cl::pci::write<BYTE>(dev.bus, dev.slot, dev.func, cap + 0x04, max_snoop_latency + 1);
-				if (cl::pci::read<BYTE>(dev.bus, dev.slot, dev.func, cap + 0x04) == max_snoop_latency)
-				{
-					port.blk = 2;
-					port.blk_info = 23;
-					return;
-				}
-				else
-				{
-					cl::pci::write<BYTE>(dev.bus, dev.slot, dev.func, cap + 0x04, max_snoop_latency);
-				}
-			}
-		}
-		break;
-	}
+                case 0x18: // LTR
+                    {
+                        BYTE max_snoop_latency = *(BYTE*)(dev.cfg.raw + cap + 0x04);
+                        cl::pci::write<BYTE>(dev.bus, dev.slot, dev.func, cap + 0x04, max_snoop_latency + 1);
+                        if (cl::pci::read<BYTE>(dev.bus, dev.slot, dev.func, cap + 0x04) == max_snoop_latency)
+                        {
+                            port.blk = 2;
+                            port.blk_info = 23;
+                            port.gummybear_reason = "LTR capability - Max Snoop Latency";
+                            return;
+                        }
+                        else
+                        {
+                            cl::pci::write<BYTE>(dev.bus, dev.slot, dev.func, cap + 0x04, max_snoop_latency);
+                        }
+                    }
+                    break;
+            }
+        }
+    }
 }
+
 
 static void scan::check_config(PORT_DEVICE_INFO &port)
 {
@@ -877,42 +872,47 @@ static void scan::PrintPcieInfo(PORT_DEVICE_INFO &port)
 		get_driver_name(port.self).c_str()
 	);
 
+	// Add this section to print gummybear detection reason
+	if (!port.gummybear_reason.empty())
+	{
+		printf("    Gummybear Detection: %s\n", port.gummybear_reason.c_str());
+	}
+
 	//
 	// print device PCIe device information
 	//
-for (auto &dev : port.devices)
-{
-    printf("    [%s] [%02d:%02d:%02d] [%04X:%04X] [%S]\n",
-        get_port_type_str(dev.cfg), dev.bus, dev.slot, dev.func, dev.cfg.vendor_id(), dev.cfg.device_id(),
-        get_driver_name(dev).c_str()
-    );
-    
-    // Print interrupt logic
-    printf("        Interrupt Logic: ");
-    if (!dev.cfg.command().interrupt_disable())
-    {
-        printf("Legacy ");
-    }
-    auto msi = dev.cfg.get_msi();
-    if (msi.cap_on && msi.cap.msi_enabled())
-    {
-        printf("MSI ");
-    }
-    auto msix = dev.cfg.get_msix();
-    if (msix.cap_on && msix.cap.msix_enabled())
-    {
-        printf("MSI-X ");
-    }
-    printf("\n");
+	for (auto &dev : port.devices)
+	{
+		printf("    [%s] [%02d:%02d:%02d] [%04X:%04X] [%S]\n",
+			get_port_type_str(dev.cfg), dev.bus, dev.slot, dev.func, dev.cfg.vendor_id(), dev.cfg.device_id(),
+			get_driver_name(dev).c_str()
+		);
+		
+		// Print interrupt logic
+		printf("        Interrupt Logic: ");
+		if (!dev.cfg.command().interrupt_disable())
+		{
+			printf("Legacy ");
+		}
+		auto msi = dev.cfg.get_msi();
+		if (msi.cap_on && msi.cap.msi_enabled())
+		{
+			printf("MSI ");
+		}
+		auto msix = dev.cfg.get_msix();
+		if (msix.cap_on && msix.cap.msix_enabled())
+		{
+			printf("MSI-X ");
+		}
+		printf("\n");
 
-	// Print interrupts fired
-	ISRDPCSTATS isr_stats{};
-    if (get_isr_stats(dev, &isr_stats))
-    {
-            printf("        Interrupts Fired: %d\n", (int)isr_stats.IsrCount);
-    }
-}
-
+		// Print interrupts fired
+		ISRDPCSTATS isr_stats{};
+		if (get_isr_stats(dev, &isr_stats))
+		{
+				printf("        Interrupts Fired: %d\n", (int)isr_stats.IsrCount);
+		}
+	}
 
 	printf("\n");
 
@@ -921,6 +921,7 @@ for (auto &dev : port.devices)
 		FontColor(7);
 	}
 }
+
 
 static void scan::PrintPcieConfiguration(unsigned char *cfg, int size)
 {
