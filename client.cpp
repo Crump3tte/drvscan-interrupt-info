@@ -1,8 +1,6 @@
 #include "client.h"
-#include "clint/clint.h"
 #include "clrt/clrt.h"
 #include <chrono>
-#pragma warning (disable: 4201)
 #pragma warning (disable: 4996)
 #include "ia32.hpp"
 
@@ -31,6 +29,8 @@ static void unsupported_error(void)
 
 namespace cl
 {
+	clrt   *clrtptr = 0;
+
 	BOOL   initialized;
 	BOOL   kernel_access;
 
@@ -40,6 +40,15 @@ namespace cl
 	QWORD  Offset_InterruptObject;
 	QWORD  PciDriverObject;
 	QWORD  AcpiDriverObject;
+	QWORD  UsbccgpDriverObject;
+	QWORD  HidUsbBase;
+	QWORD  HidUsbDriverObject;
+	QWORD  MouHidBase;
+	QWORD  MouhidDriverObject;
+
+
+	DWORD  PciClassIdOffset;
+	DWORD  PciBusLocationOffset;
 
 
 	QWORD HalpPciMcfgTableCount;
@@ -133,7 +142,7 @@ QWORD FindPattern(QWORD base, unsigned char* pattern, unsigned char* mask)
 
 		DWORD section_characteristics = *(DWORD*)(section + 0x24);
 
-		if (section_characteristics & 0x00000020 && !(section_characteristics & 0x02000000))
+		if (section_characteristics & 0x00000020)
 		{
 			QWORD virtual_address = base + (QWORD)*(DWORD*)(section + 0x0C);
 			DWORD virtual_size = *(DWORD*)(section + 0x08);
@@ -178,6 +187,7 @@ QWORD get_win32_table_ptr(cl::client *controller, PCSTR function_name, QWORD fun
 	QWORD table_ptr     = 0;
 	QWORD nt_user_func  = 0;
 	QWORD nt_user_table = 0;
+	QWORD W32GetSessionState = 0;
 	
 	for (auto &entry : get_kernel_modules())
 	{
@@ -188,6 +198,7 @@ QWORD get_win32_table_ptr(cl::client *controller, PCSTR function_name, QWORD fun
 			{
 				nt_user_table = nt_user_table + 0x70;
 			}
+			W32GetSessionState = get_kernel_export(entry.path.c_str(), entry.base, "W32GetSessionState");
 		}
 
 		if (!_strcmpi(entry.name.c_str(), "win32kfull.sys"))
@@ -200,6 +211,48 @@ QWORD get_win32_table_ptr(cl::client *controller, PCSTR function_name, QWORD fun
 		{
 			break;
 		}
+	}
+
+	//
+	// 24H2
+	//
+	if (W32GetSessionState)
+	{
+		DWORD session_id = *(DWORD*)(__readgsqword(0x60) + 0x2c0);
+		QWORD tmp        = vm::get_relative_address(4, W32GetSessionState + 0xB, 1, 5);
+
+		if (session_id)
+		{
+			tmp = vm::get_relative_address(4, tmp + 0x14, 3, 7);
+			tmp = vm::read<QWORD>(4, tmp);
+			session_id = session_id - 1;
+			tmp = vm::read<QWORD>(4, tmp + (session_id * sizeof(QWORD)));
+		}
+		else
+		{
+			tmp = vm::get_relative_address(4, tmp + 0x07, 3, 7);
+			tmp = vm::read<QWORD>(4, tmp);
+		}
+
+		QWORD rdx,rax;
+		rdx = km::read<QWORD>(tmp + 0x88);
+
+		if (!_strcmpi(function_name, "NtGdiGetEmbUFI"))
+		{
+			rax = km::read<QWORD>(rdx + 0x138);
+			rax = rax + 0x04B8;
+		}
+		else if (!_strcmpi(function_name, "NtGdiGetUFI"))
+		{
+			rax = km::read<QWORD>(rdx + 0x138);
+			rax = rax + 0x0600;
+		}
+		else
+		{
+			rax = 0;
+		}
+
+		table_ptr = rax;
 	}
 
 	if (nt_user_func == 0 || nt_user_table == 0)
@@ -261,12 +314,32 @@ QWORD get_win32_table_ptr(cl::client *controller, PCSTR function_name, QWORD fun
 	return table_ptr;
 }
 
+bool EnablePrivilege(const char* Privilege)
+{
+	HANDLE Token;
+	if (!OpenProcessToken(HANDLE(-1), TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &Token))
+		return false;
+
+	LUID Luid;
+	if (!LookupPrivilegeValueA(0, Privilege, &Luid))
+		return false;
+
+	TOKEN_PRIVILEGES TokenState = { 1, { Luid, SE_PRIVILEGE_ENABLED } };
+	if (!AdjustTokenPrivileges(Token, 0, &TokenState, sizeof(TOKEN_PRIVILEGES), 0, 0))
+		return false;
+
+	CloseHandle(Token);
+	return true;
+}
+
 BOOL cl::initialize(void)
 {
 	if (initialized != 0)
 	{
 		return 1;
 	}
+
+	EnablePrivilege("SeDebugPrivilege");
 
 	for (auto &entry : get_kernel_modules())
 	{
@@ -303,12 +376,41 @@ BOOL cl::initialize(void)
 
 		if (!_strcmpi(entry.name.c_str(), "pci.sys"))
 		{
-			PciDriverObject = get_kernel_pattern(
-				entry.path.c_str(), entry.base, (BYTE*)"\x48\x8B\x1D\x00\x00\x00\x00\x75", (BYTE*)"xxx????x");
-
-			if (PciDriverObject == 0)
+			HMODULE local_module = LoadLibraryA(entry.path.c_str());
+			QWORD temp_address = FindPattern((QWORD)local_module, (BYTE*)"\x48\x8B\xCF\x48\x09\x87", (BYTE*)"xxxxxx");
+			if (temp_address == 0)
 			{
-				LOG_RED("pci.sys PciDriverObject not found\n");
+				goto cleanup2;
+			}
+			temp_address = temp_address + 0x0A;
+			temp_address = (temp_address + 5) + *(int*)(temp_address + 1);
+			temp_address = temp_address + 0x07;
+			temp_address = (temp_address + 5) + *(int*)(temp_address + 1);
+			while (*(BYTE*)(temp_address) != 0x41) temp_address++;
+			PciClassIdOffset = *(BYTE*)(temp_address + 1);
+
+			temp_address = FindPattern((QWORD)local_module, (BYTE*)"\x8B\x45\x00\x0F\xB6\xC8\x41", (BYTE*)"xx?xxxx");
+			if (temp_address == 0)
+			{
+				goto cleanup2;
+			}
+
+			PciBusLocationOffset = *(BYTE*)(temp_address + 2);
+
+			temp_address = FindPattern((QWORD)local_module, (BYTE*)"\x48\x8B\x1D\x00\x00\x00\x00\x75", (BYTE*)"xxx????x");
+			if (temp_address == 0)
+			{
+				goto cleanup2;
+			}
+
+			temp_address    = temp_address - (QWORD)local_module;
+			temp_address    = temp_address + entry.base;
+			PciDriverObject = temp_address;
+		cleanup2:
+			FreeLibrary(local_module);
+			if (temp_address == 0)
+			{
+				LOG_RED("pci.sys DriverObject not found\n");
 				return 0;
 			}
 		}
@@ -320,9 +422,46 @@ BOOL cl::initialize(void)
 
 			if (AcpiDriverObject == 0)
 			{
-				LOG_RED("acpi.sys PciDriverObject not found\n");
+				LOG_RED("acpi.sys AcpiDriverObject not found\n");
 				return 0;
 			}
+		}
+
+		if (!_strcmpi(entry.name.c_str(), "usbccgp.sys"))
+		{
+			HMODULE ntos = LoadLibraryA(entry.path.c_str());
+
+			QWORD export_address = FindPattern((QWORD)ntos, (BYTE*)"\x48\x8B\x1D\x00\x00\x00\x00\x48\x8D\x15", (BYTE*)"xxx????xxx");
+			if (export_address == 0)
+			{
+				export_address = (QWORD)FindPattern((QWORD)ntos, (BYTE*)"\x48\x8B\xD3\x48\x89\x1D\x00\x00\x00\x00\x48\x8D\x0D", (BYTE*)"xxxxxx????xxx");
+				if (export_address == 0)
+				{
+					goto cleanup;
+				}
+				export_address += 0x03;
+			}
+			export_address = (export_address + 7) + *(int*)(export_address + 3);
+			export_address = export_address - (QWORD)ntos;
+			export_address = export_address + entry.base;
+		cleanup:
+			FreeLibrary(ntos);
+			if (export_address == 0)
+			{
+				LOG_RED("usbccgp.sys UsbccgpDriverObject not found\n");
+				return 0;
+			}
+			UsbccgpDriverObject = export_address;
+		}
+
+		if (!_strcmpi(entry.name.c_str(), "hidusb.sys"))
+		{
+			HidUsbBase = entry.base;
+		}
+
+		if (!_strcmpi(entry.name.c_str(), "mouhid.sys"))
+		{
+			MouHidBase = entry.base;
 		}
 
 		if (!_strcmpi(entry.name.c_str(), "win32kfull.sys"))
@@ -331,94 +470,101 @@ BOOL cl::initialize(void)
 		}
 	}
 
-	if (PciDriverObject == 0 || AcpiDriverObject == 0 || win32k_memmove == 0)
-	{
-		return 0;
-	}
-
 	client *controller = 0;
-	clint *intel = new clint();
 	clrt  *rt = new clrt();
 
 	if (controller == 0 && rt->initialize())
 	{
 		controller = rt;
+		clrtptr    = rt;
 	}
 	else
 	{
 		delete rt; rt = 0;
 	}
 
-	if (controller == 0 && intel->initialize())
-	{
-		controller = intel;
-	}
-	else
-	{
-		delete intel; intel = 0;
-	}
-
 	initialized = 1;
 		
-	if (rt || intel)
+	if (rt)
 	{
+		if (ntoskrnl_base == 0)
+		{
+			LOG_RED("Run as Administrator\n");
+			return 0;
+		}
+
+		if (PciDriverObject == 0 || AcpiDriverObject == 0 || win32k_memmove == 0 || UsbccgpDriverObject == 0)
+		{
+			return 0;
+		}
+
+
+
 		LoadLibraryA("user32.dll");
-		kernel_swapfn_table = get_win32_table_ptr(controller, "NtUserSetSensorPresence", 0, &kernel_swapfn_original);
-		kernel_memcpy_table = get_win32_table_ptr(controller, "NtUserSetGestureConfig", win32k_memmove, &kernel_memcpy_original);
-		kernel_memcpy = (QWORD)GetProcAddress(LoadLibraryA("win32u.dll"), "NtUserSetGestureConfig");
-		kernel_swapfn = (QWORD)GetProcAddress(LoadLibraryA("win32u.dll"), "NtUserSetSensorPresence");
+		kernel_swapfn_table = get_win32_table_ptr(controller, "NtGdiGetUFI", 0, &kernel_swapfn_original);
+		kernel_memcpy_table = get_win32_table_ptr(controller, "NtGdiGetEmbUFI", win32k_memmove, &kernel_memcpy_original);
+		kernel_memcpy = (QWORD)GetProcAddress(LoadLibraryA("win32u.dll"), "NtGdiGetEmbUFI");
+		kernel_swapfn = (QWORD)GetProcAddress(LoadLibraryA("win32u.dll"), "NtGdiGetUFI");
 
 		if (kernel_swapfn_table == 0 || kernel_memcpy_table == 0)
 		{
-			LOG_YELLOW("failed to enable kernel access %llx\n", kernel_swapfn_table);
+			LOG_RED("Failed to locate win32k functions\n");
+			return 0;
 		}
 		else
 		{
 			controller->write_kernel(kernel_memcpy_table, &win32k_memmove, sizeof(win32k_memmove));
 			kernel_access = 1;
+
+			if (rt) delete rt;
+			rt = 0;
+			controller = 0;
+			clrtptr = 0;
 		}
 
-		if (rt) delete rt;
-		if (intel) delete intel;
-
+		kernel_access = 1;
 
 		QWORD table_entry = HalPrivateDispatchTable;
 		table_entry       = vm::read<QWORD>(4, table_entry + 0xA0);
 		table_entry       = table_entry + 0x1B;
 		table_entry       = (table_entry + 5) + vm::read<INT>(4, table_entry + 1);
-		while (1)
-		{
-			if (vm::read<BYTE>(4, table_entry) == 0xE8 && vm::read<WORD>(4, table_entry + 5) == 0xFB83)
-			{
-				break;
-			}
-			table_entry++;
-		}
-		table_entry = (table_entry + 5) + vm::read<INT>(4, table_entry + 1);
-		while (1)
-		{
-			if (vm::read<DWORD>(4, table_entry) == 0xCCB70F41 && vm::read<BYTE>(4, table_entry + 4) == 0xE8)
-			{
-				table_entry += 0x04;
-				break;
-			}
-			table_entry++;
-		}
-		table_entry = (table_entry + 5) + vm::read<INT>(4, table_entry + 1);
-		table_entry = table_entry + 0x47;
-		table_entry = (table_entry + 5) + vm::read<INT>(4, table_entry + 1);
 
-		HalpPciMcfgTableCount  = vm::get_relative_address(4, table_entry + 0x07, 2, 6);
-		HalpPciMcfgTable       = vm::get_relative_address(4, table_entry + 0x11, 3, 7);
+		while (1)
+		{
+			QWORD data     = vm::read<QWORD>(4, table_entry);
+			PBYTE data_ptr = (PBYTE)&data;
+			if (data_ptr[0] == 0xE8 && *(WORD*)(data_ptr+5) == 0xC084)
+			{
+				break;
+			}
+			table_entry++;
+		}
+		table_entry = (table_entry + 5) + vm::read<INT>(4, table_entry + 1);
+		while (1)
+		{
+			DWORD data     = vm::read<DWORD>(4, table_entry);
+			PBYTE data_ptr = (PBYTE)&data;
+			if (data_ptr[0] == 0x4C && *(WORD*)(data_ptr+1) == 0x0d8b)
+			{
+				break;
+			}
+			table_entry++;
+		}
+
+
+		HalpPciMcfgTable       = vm::get_relative_address(4, table_entry, 3, 7);
+		HalpPciMcfgTableCount  = HalpPciMcfgTable - 0x18;
 
 		MmPfnDatabase          = vm::read<QWORD>(4, MmGetVirtualForPhysical + 0x0E + 0x02) - 0x08;
 		MmPteBase              = vm::read<QWORD>(4, MmGetVirtualForPhysical + 0x20 + 0x02);
 
 		AcpiDriverObject       = vm::read<QWORD>(4, vm::get_relative_address(4, AcpiDriverObject, 3, 7));
 		PciDriverObject        = vm::read<QWORD>(4, vm::get_relative_address(4, PciDriverObject, 3, 7));
+		UsbccgpDriverObject    = vm::read<QWORD>(4, UsbccgpDriverObject);
 		Offset_InterruptObject = vm::read<DWORD>(4, Offset_InterruptObject);
 
 		system_cr3             = vm::read<QWORD>(4, vm::read<QWORD>(4, PsInitialSystemProcess) + 0x28);
+
 		PciIoAddressPhysical   = pci::get_physical_address(0, 0);
 
 		std::vector<QWORD> table = efi::get_runtime_table();
@@ -443,6 +589,53 @@ BOOL cl::initialize(void)
 				break;
 			}
 		}
+
+		//
+		// resolve mouhid driver object
+		//
+		QWORD usb_device_object = km::read<QWORD>(UsbccgpDriverObject + 0x08);
+		do
+		{
+			QWORD attached_device = cl::vm::read<QWORD>(4, usb_device_object + 0x18);
+			QWORD device_object = 0;
+			while (attached_device)
+			{
+				device_object = attached_device;
+				attached_device = cl::vm::read<QWORD>(4, attached_device + 0x18);
+			}
+
+			if (device_object)
+			{
+				QWORD drv_obj = km::read<QWORD>(device_object + 0x08);
+				QWORD drv_start = km::read<QWORD>(drv_obj + 0x18);
+				if (drv_start == HidUsbBase)
+				{
+					HidUsbDriverObject = drv_obj;
+					break;
+				}
+			}
+
+			usb_device_object = km::read<QWORD>(usb_device_object + 0x10);
+		} while (usb_device_object);
+
+
+		QWORD hidusb_dev = km::read<QWORD>(HidUsbDriverObject + 0x08);
+		do
+		{
+			QWORD mouhid = km::read<QWORD>(hidusb_dev + 0x18);
+			if (mouhid)
+			{
+				QWORD drv_obj = km::read<QWORD>(mouhid + 0x08);
+				QWORD drv_start = km::read<QWORD>(drv_obj + 0x18);
+
+				if (drv_start == MouHidBase)
+				{
+					MouhidDriverObject = drv_obj;
+					break;
+				}
+			}
+			hidusb_dev = km::read<QWORD>(hidusb_dev + 0x10);
+		} while (hidusb_dev);
 	}
 	return 1;
 }
@@ -555,9 +748,47 @@ QWORD cl::get_pci_driver_object(void)
 	return PciDriverObject;
 }
 
+DWORD cl::get_pci_class_id(QWORD pci_extension)
+{
+	return vm::read<BYTE>(4, pci_extension + PciClassIdOffset + 0) << 16 |
+		vm::read<BYTE>(4, pci_extension + PciClassIdOffset + 1) << 8 | vm::read<BYTE>(4, pci_extension + PciClassIdOffset + 2);
+}
+
+void cl::get_pci_location(QWORD pci_extension, BYTE* bus, BYTE* slot, BYTE* func)
+{
+	typedef struct _PCI_SLOT_NUMBER {
+		union {
+			struct {
+				ULONG   DeviceNumber : 5;
+				ULONG   FunctionNumber : 3;
+				ULONG   Reserved : 24;
+			} bits;
+			ULONG   AsULONG;
+		} u;
+	} PCI_SLOT_NUMBER, * PPCI_SLOT_NUMBER;
+
+	*bus = km::read<DWORD>(pci_extension + PciBusLocationOffset) & 0xFF;
+
+	PCI_SLOT_NUMBER temp{};
+	temp.u.AsULONG = km::read<DWORD>(pci_extension + PciBusLocationOffset + 0x04);
+
+	*slot = temp.u.bits.DeviceNumber;
+	*func = temp.u.bits.FunctionNumber;
+}
+
 QWORD cl::get_acpi_driver_object(void)
 {
 	return AcpiDriverObject;
+}
+
+QWORD cl::get_mouhid_driver_object(void)
+{
+	return MouhidDriverObject;
+}
+
+QWORD cl::get_hidusb_driver_object(void)
+{
+	return HidUsbDriverObject;
 }
 
 QWORD cl::get_interrupt_object(DWORD index)
@@ -626,11 +857,17 @@ BOOL cl::vm::write(DWORD pid, QWORD address, PVOID buffer, QWORD length)
 
 BOOL cl::km::read(QWORD address, PVOID buffer, QWORD length)
 {
+	if (clrtptr)
+	{
+		return clrtptr->read_kernel(address, buffer, length);
+	}
+
 	if (!kernel_access)
 	{
 		unsupported_error();
 		return 0;
 	}
+
 	void* (__fastcall * func)(PVOID, PVOID, QWORD);
 	*(QWORD*)&func = kernel_memcpy;
 	func(buffer, (PVOID)address, length);
@@ -639,11 +876,17 @@ BOOL cl::km::read(QWORD address, PVOID buffer, QWORD length)
 
 BOOL cl::km::write(QWORD address, PVOID buffer, QWORD length)
 {
+	if (clrtptr)
+	{
+		return clrtptr->write_kernel(address, buffer, length);
+	}
+
 	if (!kernel_access)
 	{
 		unsupported_error();
 		return 0;
 	}
+
 	void* (*func)(PVOID, PVOID, QWORD);
 	*(QWORD*)&func = kernel_memcpy;
 	func((PVOID)address, (PVOID)buffer, length);
@@ -880,20 +1123,6 @@ BOOL cl::pci::write(BYTE bus, BYTE slot, BYTE func, DWORD offset, PVOID buffer, 
 
 namespace memory_map
 {
-	typedef union _virt_addr_t
-	{
-		QWORD value;
-		struct
-		{
-			QWORD offset : 12;
-			QWORD pt_index : 9;
-			QWORD pd_index : 9;
-			QWORD pdpt_index : 9;
-			QWORD pml4_index : 9;
-			QWORD reserved : 16;
-		};
-	} virt_addr_t, * pvirt_addr_t;
-
 	pml4e_64 pml4[512]{};
 	pdpte_64 pdpt[512]{};
 	pde_64   pde[512]{};
@@ -946,7 +1175,8 @@ std::vector<EFI_MEMORY_DESCRIPTOR> cl::efi::get_memory_map()
 	virt_addr_t virtual_previous{};
 	virt_addr_t virt{};
 
-	for (pml4_index = 256; pml4_index < 512; pml4_index++) {
+	virt.value = ntoskrnl_base;
+	for (pml4_index = virt.pml4_index; pml4_index < 512; pml4_index++) {
 		physical_address = pml4[pml4_index].page_frame_number << PAGE_SHIFT;
 		virtual_address.value = page_table;
 		virtual_address.pt_index = pml4_index;
