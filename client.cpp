@@ -434,12 +434,18 @@ BOOL cl::initialize(void)
 			QWORD export_address = FindPattern((QWORD)ntos, (BYTE*)"\x48\x8B\x1D\x00\x00\x00\x00\x48\x8D\x15", (BYTE*)"xxx????xxx");
 			if (export_address == 0)
 			{
-				export_address = (QWORD)FindPattern((QWORD)ntos, (BYTE*)"\x48\x8B\xD3\x48\x89\x1D\x00\x00\x00\x00\x48\x8D\x0D", (BYTE*)"xxxxxx????xxx");
+				export_address = FindPattern((QWORD)ntos, (BYTE*)"\x48\x8B\x3D\x00\x00\x00\x00\x48\x8D\x15", (BYTE*)"xxx????xxx");
+
 				if (export_address == 0)
 				{
-					goto cleanup;
+					export_address = (QWORD)FindPattern((QWORD)ntos, (BYTE*)"\x48\x8B\xD3\x48\x89\x1D\x00\x00\x00\x00\x48\x8D\x0D", (BYTE*)"xxxxxx????xxx");
+					if (export_address == 0)
+					{
+						goto cleanup;
+					}
+					export_address += 0x03;
 				}
-				export_address += 0x03;
+
 			}
 			export_address = (export_address + 7) + *(int*)(export_address + 3);
 			export_address = export_address - (QWORD)ntos;
